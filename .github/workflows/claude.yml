@@ -1,0 +1,228 @@
+name: Claude
+
+# Reusable: every repo of kolyabres calls this file instead of keeping a copy.
+# The caller forwards its events (pull_request, issue_comment,
+# pull_request_review_comment, pull_request_review, issues) and its secrets;
+# the github context below is the caller's, so the conditions read its event.
+on:
+  workflow_call:
+    inputs:
+      extra_prompt:
+        description: Repo-specific guidance appended to the review prompt.
+        type: string
+        required: false
+        default: ""
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  # Every push to a pull request, and "@claude review" asked for by hand. Same
+  # review either way, so it is one job with two doors rather than two jobs.
+  # github.event.issue.pull_request is what tells a pull request comment from an
+  # issue comment - issue_comment fires for both.
+  review:
+    if: |
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '@claude review'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # required to submit the review on the PR
+      issues: write
+      id-token: write
+      actions: read # lets Claude read CI results on the PR
+    env:
+      # One number, whichever event opened the door.
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # continue-on-error so the outcome review below ALWAYS gets submitted;
+      # a later step re-fails the job if the review itself failed.
+      - name: Run Claude Code Review
+        id: claude-review
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          additional_permissions: |
+            actions: read
+          # create_inline_comment is the action's own tool and the only way to
+          # anchor a finding to a line. The rest is what the plugin's agents
+          # already use; naming them keeps the allowlist from taking them away.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Task,Read,Glob,Grep,Bash"
+          prompt: |
+            /code-review:code-review ${{ github.repository }}/pull/${{ env.PR_NUMBER }}
+
+            ${{ github.event_name == 'issue_comment' && 'A person asked for this review in a comment on the pull request. Read the comments on it, and honour any scope they asked for; review the whole diff when they asked for nothing in particular.' || '' }}
+
+            Launch the review agents in parallel, all of them in one batch, and wait
+            for the whole batch inside this turn. Do not end your turn while anything
+            is still running, and never hand work to a background task: this is a
+            headless run, there is no later notification, and the process exits the
+            moment you stop - killing whatever is still working. Waiting is not the
+            same as working one agent at a time; a serial review of a large pull
+            request takes twenty minutes of a runner and is paid for by the minute.
+
+            Use the models the command asks for. Do not escalate an agent to a larger
+            model or add a second pass with one - a review of a big diff that reaches
+            for Opus on its own costs more than the change it is reviewing.
+
+            When the review is complete, end your final message with a markdown
+            outcome summary: a checklist of dimensions reviewed (correctness,
+            security, tests, conventions), findings counted by severity, and a
+            one-line verdict such as "✅ no blocking issues" or "❌ N issues to fix".
+            Leave every confirmed finding as an inline comment on the line it is
+            about, with mcp__github_inline_comment__create_inline_comment. A finding
+            described in prose at the bottom of a thread makes the reader hunt for
+            the line; one attached to the line does not. Include a suggestion block
+            when the fix is a small, complete replacement of the lines you flagged.
+
+            Close the message with these two lines exactly. They are invisible in the
+            rendered comment: the first marks the review as finished, the second is
+            read by the job to approve the pull request or request changes on it.
+            Request changes when a finding should block the merge, approve when none
+            does - a nit worth mentioning is not a reason to block.
+
+            <!-- claude-review-complete -->
+            <!-- claude-review-verdict: approve -->
+            (or <!-- claude-review-verdict: request-changes -->, one line, not both)
+
+            ${{ inputs.extra_prompt }}
+
+      # Deterministic outcome review: does NOT depend on Claude choosing to
+      # comment. Extracts Claude's final message from the execution log and
+      # submits it (with the job status) via gh. Runs on success AND failure.
+      - name: Submit the outcome as a review
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+          REVIEW_OUTCOME: ${{ steps.claude-review.outcome }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          SUMMARY=""
+          ERROR_TEXT=""
+          if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+            SUMMARY=$(jq -r '
+              [.[] | select(.type == "assistant")] | last
+              | .message.content // []
+              | map(select(.type == "text") | .text)
+              | join("\n\n")
+            ' "$EXECUTION_FILE" 2>/dev/null || true)
+
+            # Why the run produced nothing. The action hides Claude's output,
+            # so without this the review says "no review" and the reason -
+            # an expired token, a usage limit, an unknown slash command - is
+            # left in a log nobody opens.
+            ERROR_TEXT=$(jq -r '
+              [.[] | select(.type == "result")] | last
+              | select(.is_error == true)
+              | (.result // .error // "the run reported an error with no message")
+            ' "$EXECUTION_FILE" 2>/dev/null || true)
+          fi
+
+          # Exit code 0 is not proof the review ran, and neither is a final
+          # message: a run once ended with "waiting for both background agents to
+          # complete" and was called a success. The marker is the artefact - only
+          # a finished review prints it.
+          if [ "$REVIEW_OUTCOME" != "success" ]; then
+            STATUS_LINE="❌ Review job **failed** — see the [run log]($RUN_URL)."
+          elif [ -z "$SUMMARY" ]; then
+            STATUS_LINE="⚠️ Review job exited cleanly but produced no review — see the [run log]($RUN_URL)."
+          elif ! printf '%s' "$SUMMARY" | grep -qF '<!-- claude-review-complete -->'; then
+            STATUS_LINE="⚠️ Review job stopped before finishing the review — see the [run log]($RUN_URL)."
+          else
+            STATUS_LINE="✅ Review job completed."
+          fi
+
+          {
+            echo "## 🤖 Claude Code Review — outcome"
+            echo
+            echo "$STATUS_LINE"
+            echo
+            if [ -n "$SUMMARY" ]; then
+              echo "$SUMMARY"
+            else
+              echo "_No review was produced._"
+              if [ -n "$ERROR_TEXT" ]; then
+                echo
+                echo "Claude reported:"
+                echo
+                echo '```'
+                echo "$ERROR_TEXT"
+                echo '```'
+              fi
+            fi
+            echo
+            echo "---"
+            echo "_Run: [$RUN_URL]($RUN_URL) · commit ${GITHUB_SHA:0:7}_"
+          } > /tmp/outcome-comment.md
+
+          # A review, not a comment, so the verdict lands on the pull request itself
+          # and shows up as a check. Always a new one: each push is a different diff,
+          # and overwriting the last verdict loses the record of what was found and
+          # when it stopped being found.
+          #
+          # An approval fails when the token owns the pull request (github-actions
+          # opened it, say). Fall back to a plain review comment rather than losing
+          # the write-up.
+          VERDICT=$(printf '%s' "$SUMMARY" \
+            | sed -n 's/.*<!-- claude-review-verdict: *\([a-z-]*\) *-->.*/\1/p' | tail -1)
+
+          if [ "$REVIEW_OUTCOME" != "success" ] || [ -z "$SUMMARY" ]; then
+            EVENT=--comment
+          elif [ "$VERDICT" = "approve" ]; then
+            EVENT=--approve
+          elif [ "$VERDICT" = "request-changes" ]; then
+            EVENT=--request-changes
+          else
+            EVENT=--comment
+          fi
+
+          gh pr review "$PR_NUMBER" --repo "$REPO" "$EVENT" --body-file /tmp/outcome-comment.md \
+            || gh pr review "$PR_NUMBER" --repo "$REPO" --comment --body-file /tmp/outcome-comment.md
+
+      - name: Fail the job if the review failed
+        if: steps.claude-review.outcome == 'failure'
+        run: exit 1
+
+  # Everything else addressed to @claude in a thread. "@claude review" belongs to
+  # the job above, and is excluded here so one comment never starts two jobs.
+  mention:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') && !contains(github.event.comment.body, '@claude review')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read # lets Claude read CI results on PRs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
